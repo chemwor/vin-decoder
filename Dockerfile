@@ -22,7 +22,13 @@ COPY app ./app
 # That is the known limitation of this deployment, not a bug in the service,
 # and the fix is a shared cache in Postgres or Redis rather than a local file.
 ENV VIN_DB_PATH=/data/vin_cache.db
-VOLUME ["/data"]
+
+# No `VOLUME ["/data"]` here on purpose. Fly derives an implicit mount name
+# from a declared VOLUME path ("data"), which then collides with the mount
+# fly.toml names ("vin_cache") at the same destination, and the deploy fails
+# with "can't update the attached volume". fly.toml's [mounts] is what
+# provisions and attaches the volume; for plain `docker run`, pass -v
+# explicitly as the README shows.
 
 # Run as a non-root user.
 RUN useradd --create-home --uid 10001 appuser && mkdir -p /data && chown appuser /data
