@@ -1,0 +1,194 @@
+# Build pipeline: verify, then produce one immutable image.
+#
+# The two jobs are separate on purpose. `build` declares `needs: test`, so a
+# failing test or a lint violation means no image is ever produced -- there is
+# no path to a deployable artefact that skips verification. That is the whole
+# gate, expressed in one line rather than in a script that could be commented
+# out in a hurry.
+#
+# The image is tagged with the run number and pushed; it is never deployed from
+# here. Deployment is a separate, manually triggered workflow that takes that
+# number as input, so the decision to release is a human one and the thing
+# released is byte-identical to the thing that was tested.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FLY_APP: vin-decoder
+  REGISTRY: registry.fly.io
+
+concurrency:
+  # A newer push to the same branch makes an in-flight build irrelevant.
+  # Never cancel on main: those builds are release candidates someone may
+  # already be waiting to deploy.
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Dockerfile's base image. A test suite that passes on a
+          # different interpreter than the one that ships is testing something
+          # other than what ships.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Tests
+        # No network required: the vPIC and NHTSA clients are replaced through
+        # FastAPI's dependency overrides, and the client unit tests use httpx
+        # MockTransport. A CI failure here is a real failure, never NHTSA
+        # having a bad morning.
+        run: pytest -q --junitxml=test-results.xml
+
+      - name: Publish test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.xml
+          retention-days: 30
+
+  build:
+    name: Build image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build_number: ${{ github.run_number }}
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute tags
+        id: meta
+        run: |
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          IMAGE="${REGISTRY}/${FLY_APP}"
+          {
+            echo "image=${IMAGE}"
+            echo "short_sha=${SHORT_SHA}"
+            echo "build_tag=build-${{ github.run_number }}"
+            echo "sha_tag=sha-${SHORT_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Loaded into the local daemon rather than pushed, so the smoke test
+          # below runs against the exact bytes that get pushed afterwards.
+          # Building twice would leave a gap where the tested image and the
+          # released image are merely believed to be the same.
+          load: true
+          push: false
+          tags: local-build:candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=build-${{ github.run_number }}
+
+      - name: Smoke test the container
+        # Unit tests cannot catch a broken CMD, a missing file in the image, or
+        # a user that cannot write its own data directory -- which is exactly
+        # the failure that once produced a bare 500 in this service. So the
+        # container is started and questioned before it is allowed out.
+        run: |
+          set -euo pipefail
+          docker run -d --name smoke -p 8000:8000 local-build:candidate
+
+          for attempt in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null; then
+              echo "healthy after ${attempt}s"
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::container never became healthy"
+              docker logs smoke
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "--- /health ---"
+          curl -sf http://127.0.0.1:8000/health | tee /tmp/health.json
+          grep -q '"status":"ok"' /tmp/health.json
+
+          # The cache must be writable. A read-only /data answers /health fine
+          # and only fails on a cache miss, so health alone would not catch it.
+          echo "--- cache is writable ---"
+          docker exec smoke python -c "import os,sqlite3; p=os.environ['VIN_DB_PATH']; c=sqlite3.connect(p); c.execute('CREATE TABLE IF NOT EXISTS _ci_probe (x INTEGER)'); c.execute('DROP TABLE _ci_probe'); c.commit(); print('writable:', p)"
+
+          # Validation runs without touching NHTSA, so this stays deterministic.
+          echo "--- rejects a malformed VIN ---"
+          code=$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8000/lookup?vin=TOOSHORT')
+          [ "$code" = "422" ] || { echo "::error::expected 422, got $code"; exit 1; }
+
+          echo "--- serves the UI and the API docs ---"
+          curl -sf http://127.0.0.1:8000/ > /dev/null
+          curl -sf http://127.0.0.1:8000/docs > /dev/null
+
+          docker rm -f smoke
+
+      - name: Authenticate to the Fly registry
+        # Only main produces a deployable artefact. A pull request has now been
+        # linted, tested and smoke-tested, which is the point of running it --
+        # but it has not been reviewed, so it gets no image and no tag.
+        if: github.ref == 'refs/heads/main'
+        run: flyctl auth docker
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Push image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.meta.outputs.image }}"
+          for tag in "${{ steps.meta.outputs.build_tag }}" "${{ steps.meta.outputs.sha_tag }}"; do
+            docker tag local-build:candidate "${IMAGE}:${tag}"
+            docker push "${IMAGE}:${tag}"
+          done
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Build ${{ github.run_number }}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Build number | \`${{ github.run_number }}\` |"
+            echo "| Commit | \`${{ steps.meta.outputs.short_sha }}\` |"
+            echo "| Image | \`${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.build_tag }}\` |"
+            echo
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              echo "Deploy it with the **Deploy** workflow, build number \`${{ github.run_number }}\`."
+            else
+              echo "_Pull request build: verified, but no image pushed._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

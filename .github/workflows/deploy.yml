@@ -1,0 +1,153 @@
+# Release pipeline: promote an already-built image to Fly.io.
+#
+# This workflow builds nothing. It takes a build number, resolves it to the
+# image that build produced, and deploys those exact bytes. Rebuilding at
+# release time would mean the artefact that reaches production is not the one
+# that passed the tests -- a different base layer, a dependency that moved, a
+# transient upstream -- and the gap is invisible until it is not.
+#
+# Rolling back is therefore the same operation with an older number, which is
+# the main practical reason to separate the two workflows at all.
+
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Build number to deploy (from a successful Build run)"
+        required: true
+        type: string
+      reason:
+        description: "Why (release, rollback, hotfix) — recorded in the run log"
+        required: false
+        type: string
+        default: "release"
+
+env:
+  FLY_APP: vin-decoder
+  REGISTRY: registry.fly.io
+
+concurrency:
+  # Two overlapping deploys race to define what production is running.
+  # Queue them; never cancel one mid-release.
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy build ${{ inputs.build_number }}
+    runs-on: ubuntu-latest
+    # Attach a GitHub Environment so protection rules (required reviewers, a
+    # wait timer, restricted branches) can be turned on later without touching
+    # this file. The secret lives here too, not at repository scope.
+    environment:
+      name: production
+      url: https://${{ vars.FLY_APP_URL || 'vin-decoder.fly.dev' }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify that build ${{ inputs.build_number }} passed
+        # The image tag alone proves an image exists, not that it earned its
+        # place. This asks GitHub whether the Build run bearing that number
+        # actually succeeded, which closes the gap where someone deploys a
+        # number they half-remember.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_json=$(gh run list \
+            --workflow build.yml \
+            --branch main \
+            --limit 100 \
+            --json number,databaseId,headSha,conclusion,url \
+            --jq '.[] | select(.number == ${{ inputs.build_number }})')
+
+          if [ -z "$run_json" ]; then
+            echo "::error::No Build run numbered ${{ inputs.build_number }} on main."
+            exit 1
+          fi
+
+          conclusion=$(echo "$run_json" | jq -r .conclusion)
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::Build ${{ inputs.build_number }} concluded '${conclusion}', not success."
+            exit 1
+          fi
+
+          {
+            echo "BUILD_SHA=$(echo "$run_json" | jq -r .headSha)"
+            echo "BUILD_URL=$(echo "$run_json" | jq -r .url)"
+          } >> "$GITHUB_ENV"
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Confirm the image exists
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          flyctl auth docker
+          IMAGE="${REGISTRY}/${FLY_APP}:build-${{ inputs.build_number }}"
+          if ! docker manifest inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "::error::${IMAGE} is not in the registry."
+            exit 1
+          fi
+          echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Deploy
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Deploying ${IMAGE} (commit ${BUILD_SHA}) — ${{ inputs.reason }}"
+          # Rolling by default: Fly replaces machines one at a time and health
+          # checks gate each replacement, so a container that will not start
+          # never takes the whole app down with it.
+          flyctl deploy \
+            --app "$FLY_APP" \
+            --image "$IMAGE" \
+            --strategy rolling \
+            --wait-timeout 300
+
+      - name: Smoke test the release
+        # Against the public URL, so this covers the proxy, TLS and routing --
+        # none of which the in-CI container test can see.
+        run: |
+          set -euo pipefail
+          URL="https://${{ vars.FLY_APP_URL || 'vin-decoder.fly.dev' }}"
+
+          for attempt in $(seq 1 20); do
+            if curl -sf "${URL}/health" > /tmp/health.json; then
+              break
+            fi
+            if [ "$attempt" -eq 20 ]; then
+              echo "::error::${URL}/health did not respond after release"
+              exit 1
+            fi
+            sleep 3
+          done
+
+          cat /tmp/health.json
+          grep -q '"status":"ok"' /tmp/health.json
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' "${URL}/lookup?vin=TOOSHORT")
+          [ "$code" = "422" ] || { echo "::error::expected 422, got $code"; exit 1; }
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Deployed build ${{ inputs.build_number }}"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${IMAGE:-unresolved}\` |"
+            echo "| Commit | \`${BUILD_SHA:-unknown}\` |"
+            echo "| Build run | ${BUILD_URL:-unknown} |"
+            echo "| Reason | ${{ inputs.reason }} |"
+            echo
+            echo "To roll back, run this workflow again with the previous build number."
+          } >> "$GITHUB_STEP_SUMMARY"
