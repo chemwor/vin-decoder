@@ -369,6 +369,14 @@ Before deploying, it asks the GitHub API whether the Build run bearing that
 number actually concluded `success`. An image tag proves an image exists, not
 that it earned its place.
 
+Before deploying it also runs a preflight against Fly's actual state,
+verifying that a volume named `[mounts] source` exists in `primary_region` and
+can be claimed. Volume problems otherwise surface only part-way through
+`flyctl deploy`, with an error naming the symptom rather than the fix; the
+preflight fails early and prints the `fly volumes create` command that resolves
+it. It reads the expected name and region from `fly.toml`, so editing that file
+cannot drift from what the pipeline checks.
+
 Releases use Fly's rolling strategy, so health checks gate each machine
 replacement and a container that will not start never takes the app down with
 it. Afterwards the workflow polls the public `/health` — which covers the proxy,

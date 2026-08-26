@@ -84,6 +84,14 @@ jobs:
 
       - uses: superfly/flyctl-actions/setup-flyctl@master
 
+      - name: Set up Python
+        # The preflight script uses tomllib (3.11+). Pinned rather than relying
+        # on whatever the runner image happens to ship.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+
       - name: Confirm the image exists
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
@@ -96,6 +104,20 @@ jobs:
             exit 1
           fi
           echo "IMAGE=${IMAGE}" >> "$GITHUB_ENV"
+
+      - name: Preflight — Fly volume matches fly.toml
+        # Three consecutive releases failed here on volume state, each with an
+        # error describing the symptom rather than the fix. These preconditions
+        # are knowable before `flyctl deploy` runs, so they are checked first
+        # and reported with the command that resolves them.
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          flyctl volumes list --app "$FLY_APP" --json > /tmp/volumes.json
+          flyctl machine list --app "$FLY_APP" --json > /tmp/machines.json
+          python3 .github/scripts/preflight_volume.py \
+            fly.toml /tmp/volumes.json /tmp/machines.json "$FLY_APP"
 
       - name: Deploy
         env:
