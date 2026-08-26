@@ -71,6 +71,46 @@ each accept a query-parameter form and a JSON-body form that share one handler.
 - **No check-digit validation.** Position 9 of a VIN is a checksum that could
   be verified locally, rejecting typos before they cost a network call. It is
   about fifteen lines and I left it out to keep the validation story simple.
+- **The recall flag is a screening signal, not a decision.** NHTSA's public API
+  indexes recalls by year/make/model; VIN-level remedy status lives behind each
+  manufacturer's own lookup. So `/underwrite` cannot tell a repaired car from an
+  unrepaired one, and every assessment says so via `vin_level_verified: false`
+  and a caveat string carried in the response and rendered above the flags in
+  the UI. The rules are asymmetric on purpose: a repaired car may be sent to
+  review, but an unrepaired one is never cleared. Wiring in a manufacturer VIN
+  API is what would upgrade this from screening to decision.
+- **Model names do not always match between NHTSA services.** vPIC decodes to
+  marketing names ("Street Glide"), while the recalls index uses factory codes
+  ("FLHX"). That mismatch answers HTTP 400, which is reported as
+  `INSUFFICIENT_DATA` with the reason rather than being read as "no recalls" --
+  the campaigns exist, we just cannot address them by name. Resolving the name
+  against `/products/vehicle/models` would close most of this gap and is the
+  most valuable next piece of work on this feature.
+- **Storage failures are 503, but only the operational ones.** SQLite raises
+  `OperationalError` for conditions outside the code -- a read-only file, a lock
+  it could not take, an unreachable disk -- and those become a 503 naming the
+  likely cause. Its siblings (`IntegrityError`, `ProgrammingError`) mean the
+  statement itself is wrong, and a 503 inviting a retry would be a lie about a
+  bug that will fail identically every time, so those keep the default 500.
+  This came out of a real incident: the cache file ended up owned by another
+  user, cached VINs answered 200 and only misses failed, and the bare
+  "Internal Server Error" gave nothing to go on.
+- **Claims routing trusts `VehicleType` completely.** It was populated on all
+  17 vehicles in the development cache, including the motorcycle and the Class 8
+  tractor, so the routing is a lookup rather than an inference. If vPIC ever
+  returns it blank the vehicle goes to `UNCLASSIFIED` and a human, which is the
+  right failure but means a silent upstream change would show up as a queue of
+  manual triage rather than as an error.
+- **Energy-source flags are handling notes, not risk scores.** They sit beside
+  the underwriting decision rather than inside it, on the view that a BEV is not
+  a worse risk than an ICE car but is a differently handled one. Someone could
+  reasonably argue an insurer *does* want EV status priced, not just routed;
+  that would be a scoring model, and it would need loss data this service does
+  not have.
+- **Safety-rating variant matching is heuristic.** NCAP lists one row per body
+  style and the descriptions share little vocabulary with vPIC's `BodyClass`,
+  so `_best_variant` scores a few tokens and falls back to the first row. Worst
+  case it reports a sibling trim's stars.
 
 ## If this had to take real traffic
 

@@ -11,18 +11,15 @@ then have to pivot client-side. Same data, more work, more to go wrong.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import random
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from . import upstream
 
-# HTTP statuses worth trying again. Everything else is a bug in our request.
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+logger = logging.getLogger(__name__)
 
 
 class VpicError(Exception):
@@ -76,42 +73,16 @@ class VpicClient:
 
     async def decode(self, vin: str) -> DecodedVin:
         url = f"{self._base_url}/DecodeVinValues/{vin}"
-        payload = await self._get_json(url, params={"format": "json"})
+        payload = await upstream.get_json(
+            self._client,
+            url,
+            params={"format": "json"},
+            max_retries=self._max_retries,
+            unavailable=VpicUnavailable,
+            bad_response=VpicBadResponse,
+            label="vPIC",
+        )
         return _parse(vin, payload)
-
-    async def _get_json(self, url: str, params: dict[str, str]) -> dict[str, Any]:
-        last_error: Exception | None = None
-
-        for attempt in range(self._max_retries + 1):
-            try:
-                response = await self._client.get(url, params=params)
-                if response.status_code in _RETRYABLE_STATUS:
-                    last_error = VpicUnavailable(f"vPIC returned HTTP {response.status_code}")
-                elif response.status_code >= 400:
-                    # Non-retryable: a 404 here means we built a bad URL.
-                    raise VpicBadResponse(f"vPIC returned HTTP {response.status_code}")
-                else:
-                    try:
-                        return response.json()
-                    except ValueError as exc:
-                        raise VpicBadResponse("vPIC returned non-JSON body") from exc
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_error = VpicUnavailable(f"vPIC request failed: {exc}")
-
-            if attempt < self._max_retries:
-                # Exponential backoff with jitter, so a burst of requests that
-                # all fail together does not retry in lockstep.
-                delay = (2**attempt) * 0.25 + random.uniform(0, 0.1)
-                logger.warning(
-                    "vPIC attempt %s/%s failed (%s); retrying in %.2fs",
-                    attempt + 1,
-                    self._max_retries + 1,
-                    last_error,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-
-        raise last_error or VpicUnavailable("vPIC request failed")
 
 
 def _parse(vin: str, payload: dict[str, Any]) -> DecodedVin:

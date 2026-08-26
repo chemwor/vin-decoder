@@ -30,6 +30,20 @@ CREATE TABLE IF NOT EXISTS vin_cache (
     raw_json    TEXT NOT NULL,
     fetched_at  TEXT NOT NULL
 );
+
+-- Recalls and safety ratings are keyed by year/make/model, not by VIN, so
+-- they get their own table. One row serves every VIN that decodes to the same
+-- vehicle, which is the whole reason this is worth caching: a fleet upload of
+-- 500 Ford Escapes is one NHTSA fetch, not 500.
+CREATE TABLE IF NOT EXISTS vehicle_profile_cache (
+    profile_key  TEXT PRIMARY KEY,
+    model_year   TEXT NOT NULL,
+    make         TEXT NOT NULL,
+    model        TEXT NOT NULL,
+    recalls_json TEXT NOT NULL,
+    ratings_json TEXT NOT NULL,
+    fetched_at   TEXT NOT NULL
+);
 """
 
 # Column order used by /export. Kept explicit so the parquet schema is stable
@@ -60,6 +74,31 @@ class CachedVin:
             return False
         now = now or datetime.now(UTC)
         return now - self.fetched_at > timedelta(seconds=ttl_seconds)
+
+
+@dataclass(frozen=True)
+class CachedProfile:
+    """Cached recalls + safety ratings for one year/make/model."""
+
+    profile_key: str
+    model_year: str
+    make: str
+    model: str
+    recalls: list[Any] | None
+    ratings: dict[str, Any] | None
+    fetched_at: datetime
+
+    def is_expired(self, ttl_seconds: int, now: datetime | None = None) -> bool:
+        """TTL of 0 means entries never expire."""
+        if ttl_seconds <= 0:
+            return False
+        now = now or datetime.now(UTC)
+        return now - self.fetched_at > timedelta(seconds=ttl_seconds)
+
+
+def profile_key(model_year: str, make: str, model: str) -> str:
+    """Stable cache key. Upper-cased so casing differences collapse to one row."""
+    return f"{model_year.strip()}|{make.strip().upper()}|{model.strip().upper()}"
 
 
 class VinCache:
@@ -146,9 +185,80 @@ class VinCache:
             self._conn.commit()
             return cur.rowcount > 0
 
+    # ---- vehicle profiles (recalls + safety ratings) ---------------------
+
+    def get_profile(self, key: str) -> CachedProfile | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM vehicle_profile_cache WHERE profile_key = ?", (key,)
+            ).fetchone()
+        return _row_to_profile(row) if row else None
+
+    def upsert_profile(
+        self,
+        key: str,
+        model_year: str,
+        make: str,
+        model: str,
+        recalls: list[Any] | None,
+        ratings: dict[str, Any] | None,
+        fetched_at: datetime | None = None,
+    ) -> CachedProfile:
+        """Store a fetched profile.
+
+        `None` for recalls means the fetch failed and is stored as SQL NULL, so
+        a later read can tell "we asked and there are none" (empty list) apart
+        from "we never got an answer". Clearing a vehicle on the second reading
+        would be exactly the wrong outcome.
+        """
+        ts = fetched_at or datetime.now(UTC)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO vehicle_profile_cache
+                    (profile_key, model_year, make, model, recalls_json,
+                     ratings_json, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(profile_key) DO UPDATE SET
+                    model_year   = excluded.model_year,
+                    make         = excluded.make,
+                    model        = excluded.model,
+                    recalls_json = excluded.recalls_json,
+                    ratings_json = excluded.ratings_json,
+                    fetched_at   = excluded.fetched_at
+                """,
+                (
+                    key,
+                    model_year,
+                    make,
+                    model,
+                    json.dumps(recalls, separators=(",", ":")) if recalls is not None else "null",
+                    json.dumps(ratings, separators=(",", ":")) if ratings is not None else "null",
+                    ts.isoformat(),
+                ),
+            )
+            self._conn.commit()
+        return CachedProfile(key, model_year, make, model, recalls, ratings, ts)
+
+    def count_profiles(self) -> int:
+        with self._lock:
+            return self._conn.execute("SELECT COUNT(*) FROM vehicle_profile_cache").fetchone()[0]
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+
+def _row_to_profile(row: sqlite3.Row) -> CachedProfile:
+    return CachedProfile(
+        profile_key=row["profile_key"],
+        model_year=row["model_year"],
+        make=row["make"],
+        model=row["model"],
+        recalls=json.loads(row["recalls_json"]),
+        ratings=json.loads(row["ratings_json"]),
+        fetched_at=datetime.fromisoformat(row["fetched_at"]),
+    )
 
 
 def _row_to_cached(row: sqlite3.Row) -> CachedVin:

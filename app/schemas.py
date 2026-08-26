@@ -87,3 +87,130 @@ class ErrorResponse(BaseModel):
 
     detail: str
     vin: str | None = None
+
+
+# --- underwriting ----------------------------------------------------------
+#
+# A separate response model from LookupResponse rather than extra optional
+# fields on it. /lookup answers "what is this VIN" from one cached row in
+# milliseconds; /underwrite answers "should we write this risk" and may hit two
+# more upstreams. Keeping them apart means the fast path stays fast and its
+# contract stays exactly what the spec asked for.
+
+
+class SpecItemModel(BaseModel):
+    label: str
+    value: str
+
+
+class MechanicalModel(BaseModel):
+    """Structural and mechanical detail, projected from the stored decode."""
+
+    powertrain: list[SpecItemModel] = []
+    structure: list[SpecItemModel] = []
+    safety_equipment: list[SpecItemModel] = []
+
+
+class RecallModel(BaseModel):
+    campaign_number: str
+    component: str
+    summary: str
+    consequence: str
+    remedy: str
+    manufacturer: str
+    report_received_date: str | None = None
+    park_it: bool = False
+    park_outside: bool = False
+    over_the_air_update: bool = False
+
+
+class SafetyRatingModel(BaseModel):
+    vehicle_description: str
+    overall: str
+    overall_front: str
+    overall_side: str
+    rollover: str
+    rollover_possibility: float | None = None
+    electronic_stability_control: str
+    forward_collision_warning: str
+    lane_departure_warning: str
+    complaints_count: int
+    recalls_count: int
+    investigation_count: int
+
+
+class FlagModel(BaseModel):
+    code: str = Field(..., description="Stable machine-readable flag code")
+    severity: str = Field(..., description="critical | warning | info")
+    title: str
+    detail: str
+    campaigns: list[str] = []
+
+
+class AssessmentModel(BaseModel):
+    decision: str = Field(..., description="BLOCK | REFER | CLEAR | INSUFFICIENT_DATA")
+    headline: str
+    flags: list[FlagModel] = []
+    open_recall_count: int
+    vin_level_verified: bool = Field(
+        ...,
+        description=(
+            "Always false: NHTSA's public API cannot confirm whether a campaign "
+            "was remedied on this specific VIN"
+        ),
+    )
+    caveat: str
+    assessed_at: str
+
+
+class RiskFlagModel(BaseModel):
+    code: str
+    severity: str
+    title: str
+    detail: str
+
+
+class ClaimsRoutingModel(BaseModel):
+    queue: str = Field(..., description="Handling queue, e.g. COMMERCIAL_TRUCK")
+    label: str
+    basis: str = Field(..., description="The decoded fields that produced this queue")
+    commercial: bool
+
+
+class EnergySourceModel(BaseModel):
+    kind: str = Field(..., description="BEV | PHEV | HEV | MILD_HEV | FCEV | ICE_* | ...")
+    label: str
+    battery_type: str = ""
+    basis: str
+    flags: list[RiskFlagModel] = []
+
+
+class RiskProfileModel(BaseModel):
+    """Classification, kept separate from the recall-based decision.
+
+    These describe how a claim on this vehicle should be handled. They do not
+    move the underwriting decision, which is about defects rather than
+    characteristics.
+    """
+
+    claims_routing: ClaimsRoutingModel
+    energy_source: EnergySourceModel
+
+
+class UnderwriteResponse(BaseModel):
+    """Everything an underwriter needs for a first-pass decision on one VIN."""
+
+    vin: str
+    make: str
+    model: str
+    model_year: str
+    body_class: str
+    underwriting: AssessmentModel
+    recalls: list[RecallModel] = []
+    safety_rating: SafetyRatingModel | None = None
+    mechanical: MechanicalModel
+    risk_profile: RiskProfileModel
+    data_gaps: list[str] = []
+    cached_result: bool = Field(
+        ..., description="True if both the decode and the recall profile came from cache"
+    )

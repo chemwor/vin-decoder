@@ -19,18 +19,22 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.responses import FileResponse
 
 from . import service
 from .db import VinCache
-from .dependencies import get_cache, get_vpic_client
+from .dependencies import get_cache, get_nhtsa_client, get_vpic_client
 from .export import build_parquet
+from .nhtsa import NhtsaClient
 from .schemas import (
     ErrorResponse,
     LookupResponse,
     RemoveResponse,
+    UnderwriteResponse,
     VinRequest,
     normalize_vin,
 )
@@ -38,9 +42,15 @@ from .vpic import VpicClient
 
 router = APIRouter()
 
+# Resolved from this file, never from the working directory: the page has to
+# be found the same way whether the app is started from the project root, an
+# IDE run configuration, or /srv in the container.
+STATIC_DIR = Path(__file__).parent / "static"
+
 LOOKUP_ERRORS = {
     422: {"model": ErrorResponse, "description": "VIN is malformed or not decodable"},
     502: {"model": ErrorResponse, "description": "vPIC unavailable"},
+    503: {"model": ErrorResponse, "description": "The local cache is unreadable or unwritable"},
 }
 
 
@@ -62,6 +72,7 @@ def vin_query(
 Vin = Annotated[str, Depends(vin_query)]
 Cache = Annotated[VinCache, Depends(get_cache)]
 Vpic = Annotated[VpicClient, Depends(get_vpic_client)]
+Nhtsa = Annotated[NhtsaClient, Depends(get_nhtsa_client)]
 
 
 # --- /lookup ---------------------------------------------------------------
@@ -134,6 +145,38 @@ async def export_cache(cache: Cache) -> Response:
     )
 
 
+# --- /underwrite -----------------------------------------------------------
+
+
+@router.get(
+    "/underwrite",
+    response_model=UnderwriteResponse,
+    responses=LOOKUP_ERRORS,
+    tags=["underwriting"],
+)
+async def underwrite_get(vin: Vin, cache: Cache, vpic: Vpic, nhtsa: Nhtsa) -> UnderwriteResponse:
+    """Decode a VIN and assess it for open recalls.
+
+    Separate from /lookup rather than folded into it: this can make two further
+    upstream calls, and callers who only need the decode should not pay for
+    them. The same 422/502 rules apply, because both start with the same decode.
+    """
+    return await service.underwrite(vin, cache, vpic, nhtsa)
+
+
+@router.post(
+    "/underwrite",
+    response_model=UnderwriteResponse,
+    responses=LOOKUP_ERRORS,
+    tags=["underwriting"],
+)
+async def underwrite_post(
+    payload: VinRequest, cache: Cache, vpic: Vpic, nhtsa: Nhtsa
+) -> UnderwriteResponse:
+    """Decode a VIN and assess it for open recalls."""
+    return await service.underwrite(payload.vin, cache, vpic, nhtsa)
+
+
 # --- operational -----------------------------------------------------------
 
 
@@ -141,4 +184,19 @@ async def export_cache(cache: Cache) -> Response:
 async def health(cache: Cache) -> dict[str, object]:
     """Liveness plus a cheap readiness signal (the DB answers a query)."""
     cached = await asyncio.to_thread(cache.count)
-    return {"status": "ok", "cached_vins": cached}
+    profiles = await asyncio.to_thread(cache.count_profiles)
+    return {"status": "ok", "cached_vins": cached, "cached_profiles": profiles}
+
+
+# --- ui --------------------------------------------------------------------
+
+
+@router.get("/", include_in_schema=False)
+async def index() -> FileResponse:
+    """Serve the demo client at the API's own origin.
+
+    Same-origin is what lets the page call /lookup and friends with no CORS
+    middleware and no preflight. Hidden from the schema because /docs is the
+    documentation for machines; this is the one for humans.
+    """
+    return FileResponse(STATIC_DIR / "index.html", media_type="text/html")

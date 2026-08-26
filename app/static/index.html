@@ -1,0 +1,733 @@
+<!doctype html>
+<!--
+  Demo client for the VIN decoder.
+
+  Served by FastAPI itself, from the same origin as the API. That is a
+  deliberate choice, not a shortcut: same-origin means no CORS middleware, no
+  preflight requests, and no second thing to deploy. CORS would only be needed
+  if this page were hosted somewhere else, and even then it would be granting
+  a browser permission rather than restricting access. See NOTES.md.
+
+  No framework and no build step. The point of this page is to make the cache
+  visible: watch the badge flip from LIVE to CACHED and the timing collapse on
+  the second lookup of the same VIN.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VIN Decoder</title>
+<!-- Inline favicon: avoids a 404 on /favicon.ico without adding a second static file. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d6b60'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='15' font-weight='bold' fill='white' text-anchor='middle'%3EV%3C/text%3E%3C/svg%3E">
+<style>
+  :root {
+    --ground: #f5f7f6;
+    --surface: #ffffff;
+    --sunk: #eceff0;
+    --line: #d6dedc;
+    --text: #17201f;
+    --dim: #5a6866;
+    --faint: #808d8b;
+    --accent: #0d6b60;
+    --accent-soft: #e2efec;
+    --live: #9a5518;
+    --live-soft: #f8ece2;
+    --danger: #a5342b;
+    --danger-soft: #f9e8e6;
+    --mono: ui-monospace, "SF Mono", "IBM Plex Mono", Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0f1615;
+      --surface: #18211f;
+      --sunk: #131c1a;
+      --line: #2b3836;
+      --text: #dfe7e5;
+      --dim: #9aa8a5;
+      --faint: #778482;
+      --accent: #4fb9a8;
+      --accent-soft: #16302c;
+      --live: #d99257;
+      --live-soft: #2d2119;
+      --danger: #e08a80;
+      --danger-soft: #2e1c1a;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--text);
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 780px; margin: 0 auto; padding: 40px 20px 80px; }
+
+  header { border-bottom: 1px solid var(--line); padding-bottom: 18px; margin-bottom: 28px; }
+
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--accent); margin: 0 0 8px;
+  }
+
+  h1 { font-size: 1.7rem; letter-spacing: -.02em; margin: 0 0 6px; }
+
+  .sub { color: var(--dim); margin: 0; font-size: .94rem; }
+
+  .stats {
+    display: flex; gap: 20px; margin-top: 16px;
+    font-family: var(--mono); font-size: 12px; color: var(--faint);
+  }
+  .stats b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* --- form --- */
+
+  form { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+
+  input[type=text] {
+    flex: 1 1 260px; min-width: 0;
+    font-family: var(--mono); font-size: 15px; letter-spacing: .04em;
+    text-transform: uppercase;
+    padding: 11px 13px;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--line); border-radius: 3px;
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+  input[type=text]::placeholder { text-transform: none; letter-spacing: 0; color: var(--faint); }
+
+  button {
+    font: inherit; font-weight: 600; font-size: 14px;
+    padding: 11px 18px; border-radius: 3px; cursor: pointer;
+    background: var(--accent); color: var(--ground); border: 1px solid var(--accent);
+  }
+  button:hover:not(:disabled) { filter: brightness(1.08); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.ghost { background: transparent; color: var(--dim); border-color: var(--line); font-weight: 500; }
+  button.ghost:hover { color: var(--accent); border-color: var(--accent); filter: none; }
+
+  .samples { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 28px; align-items: center; }
+  .samples span { font-size: 12px; color: var(--faint); margin-right: 2px; }
+  .chip {
+    font-family: var(--mono); font-size: 11.5px;
+    background: var(--surface); color: var(--dim);
+    border: 1px solid var(--line); border-radius: 3px;
+    padding: 4px 8px; cursor: pointer;
+  }
+  .chip:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* --- result --- */
+
+  #result:empty { display: none; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 3px; padding: 20px 22px; margin-bottom: 28px;
+  }
+  .card.error { border-left: 3px solid var(--danger); }
+
+  .card-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+  .vin { font-family: var(--mono); font-size: 15px; letter-spacing: .06em; font-weight: 600; }
+
+  .badge {
+    font-family: var(--mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .1em; text-transform: uppercase;
+    padding: 4px 9px; border-radius: 2px;
+  }
+  .badge.cached { background: var(--accent-soft); color: var(--accent); }
+  .badge.live { background: var(--live-soft); color: var(--live); }
+
+  .timing { font-family: var(--mono); font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+
+  dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 18px 24px; margin: 0; }
+  dl > div { min-width: 0; }
+  dt { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin-bottom: 3px; }
+  dd { margin: 0; font-size: 15px; font-weight: 500; }
+  dd.empty { color: var(--faint); font-weight: 400; font-style: italic; }
+
+  .err-detail { margin: 0; color: var(--dim); font-size: .94rem; }
+  .err-code { font-family: var(--mono); font-size: 11px; color: var(--danger); letter-spacing: .08em; text-transform: uppercase; }
+
+  /* --- history --- */
+
+  h2 { font-size: .82rem; font-family: var(--mono); letter-spacing: .12em; text-transform: uppercase;
+       color: var(--faint); font-weight: 500; margin: 0 0 10px; }
+
+  .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 3px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; min-width: 520px; }
+  th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  th { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+       color: var(--faint); font-weight: 500; background: var(--sunk); }
+  tr:last-child td { border-bottom: none; }
+  td.vin-cell { font-family: var(--mono); font-size: 12px; letter-spacing: .04em; }
+  td.ms { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--faint); font-size: 12px; }
+  td.act { text-align: right; }
+  td.act button { padding: 3px 9px; font-size: 11.5px; font-weight: 500; }
+
+  .empty-state { padding: 22px; color: var(--faint); font-size: 13.5px; text-align: center; }
+
+  .footer-actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; align-items: center; }
+  .hint { font-size: 12px; color: var(--faint); }
+
+  a { color: var(--accent); }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+  /* --- underwriting --------------------------------------------------------
+     Colour carries the decision, but never alone: every state also has a word
+     ("BLOCK", "REFER"), because a red/amber distinction is exactly the one a
+     red-green colour-blind underwriter cannot make. */
+
+  #underwriting:empty { display: none; }
+  .uw { margin-top: 20px; margin-bottom: 34px; }
+
+  .uw-banner {
+    display: flex; gap: 13px; align-items: flex-start;
+    padding: 14px 16px; border: 1px solid var(--line);
+    border-radius: 4px; background: var(--surface);
+  }
+  .uw-banner.block  { border-color: var(--danger); background: var(--danger-soft); }
+  .uw-banner.refer  { border-color: var(--live);   background: var(--live-soft); }
+  .uw-banner.clear  { border-color: var(--accent); background: var(--accent-soft); }
+  .uw-banner.unknown { border-style: dashed; background: var(--sunk); }
+
+  .decision {
+    font-family: var(--mono); font-size: 11px; font-weight: 700;
+    letter-spacing: .1em; padding: 4px 9px; border-radius: 3px;
+    white-space: nowrap; color: var(--surface);
+  }
+  .uw-banner.block  .decision { background: var(--danger); }
+  .uw-banner.refer  .decision { background: var(--live); }
+  .uw-banner.clear  .decision { background: var(--accent); }
+  .uw-banner.unknown .decision { background: var(--faint); }
+
+  .uw-headline { font-weight: 600; }
+  .uw-sub { font-size: 12.5px; color: var(--dim); margin-top: 3px; }
+
+  .classify { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+              gap: 10px; margin-top: 14px; }
+  .classify .box { background: var(--sunk); border-radius: 3px; padding: 11px 12px; }
+  .classify .k {
+    font-size: 10.5px; font-family: var(--mono); letter-spacing: .09em;
+    text-transform: uppercase; color: var(--faint);
+  }
+  .classify .v { font-weight: 600; margin-top: 3px; }
+  .classify .why { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-top: 4px; }
+  .pill {
+    display: inline-block; font-family: var(--mono); font-size: 10px; letter-spacing: .07em;
+    text-transform: uppercase; padding: 2px 6px; border-radius: 2px; margin-left: 6px;
+    background: var(--accent-soft); color: var(--accent); vertical-align: 1px;
+  }
+
+  .caveat {
+    font-size: 12px; color: var(--dim); line-height: 1.5;
+    border-left: 2px solid var(--line); padding: 2px 0 2px 11px; margin: 12px 0 0;
+  }
+
+  .flags { list-style: none; padding: 0; margin: 14px 0 0; display: grid; gap: 7px; }
+  .flag {
+    display: flex; gap: 10px; align-items: baseline;
+    background: var(--sunk); border-radius: 3px; padding: 9px 11px; font-size: 13px;
+  }
+  .sev {
+    font-family: var(--mono); font-size: 10px; letter-spacing: .07em;
+    text-transform: uppercase; padding: 2px 6px; border-radius: 2px; white-space: nowrap;
+  }
+  .sev.critical { background: var(--danger); color: var(--surface); }
+  .sev.warning  { background: var(--live-soft); color: var(--live); border: 1px solid var(--live); }
+  .sev.info     { background: var(--surface); color: var(--faint); border: 1px solid var(--line); }
+  .flag-title { font-weight: 600; }
+  .flag-detail { color: var(--dim); }
+  .flag-campaigns { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-top: 4px; }
+
+  details.uw-section { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+  details.uw-section > summary {
+    cursor: pointer; font-family: var(--mono); font-size: 11.5px;
+    letter-spacing: .1em; text-transform: uppercase; color: var(--dim);
+  }
+  details.uw-section > summary:hover { color: var(--accent); }
+
+  .recall {
+    border: 1px solid var(--line); border-radius: 3px;
+    padding: 11px 12px; margin-top: 9px; background: var(--surface);
+  }
+  .recall.severe { border-left: 3px solid var(--danger); }
+  .recall-top { display: flex; gap: 9px; align-items: center; flex-wrap: wrap; margin-bottom: 5px; }
+  .campaign { font-family: var(--mono); font-size: 12px; font-weight: 600; }
+  .recall-date { font-size: 11.5px; color: var(--faint); margin-left: auto; }
+  .component { font-size: 12px; color: var(--accent); font-family: var(--mono); }
+  .recall-text { font-size: 12.5px; color: var(--dim); margin: 6px 0 0; }
+  .recall-text b { color: var(--text); font-weight: 600; }
+
+  .stars { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 10px; }
+  .star-item .star-label {
+    font-size: 10.5px; font-family: var(--mono); letter-spacing: .08em;
+    text-transform: uppercase; color: var(--faint);
+  }
+  .star-item .star-value { font-size: 15px; font-weight: 600; }
+
+  .spec-group { margin-top: 12px; }
+  .spec-group h3 {
+    font-size: 10.5px; font-family: var(--mono); letter-spacing: .1em;
+    text-transform: uppercase; color: var(--faint); margin: 0 0 6px;
+  }
+  .spec-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 20px; }
+  .spec { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px;
+          border-bottom: 1px dotted var(--line); padding-bottom: 3px; }
+  .spec .k { color: var(--faint); }
+  .spec .v { text-align: right; }
+
+  .uw-loading { font-size: 12.5px; color: var(--faint); margin-top: 16px; font-family: var(--mono); }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">NHTSA vPIC · SQLite cache</p>
+    <h1>VIN Decoder</h1>
+    <p class="sub">Look up the same VIN twice. The second one never touches the network.</p>
+    <div class="stats">
+      <span>cached vins <b id="stat-count">–</b></span>
+      <span>this session <b id="stat-lookups">0</b></span>
+      <span>hits <b id="stat-hits">0</b></span>
+      <span>ymm profiles <b id="stat-profiles">–</b></span>
+      <span><a href="/docs">api docs</a></span>
+    </div>
+  </header>
+
+  <form id="form" autocomplete="off">
+    <input type="text" id="vin" name="vin" maxlength="17" spellcheck="false"
+           placeholder="Enter a 17-character VIN" aria-label="VIN">
+    <button type="submit" id="submit">Decode</button>
+  </form>
+
+  <div class="samples" id="samples"><span>try:</span></div>
+
+  <div id="result"></div>
+  <div id="underwriting"></div>
+
+  <h2>Session history</h2>
+  <div class="table-scroll">
+    <table>
+      <thead>
+        <tr><th>VIN</th><th>Vehicle</th><th>Source</th><th>Time</th><th></th></tr>
+      </thead>
+      <tbody id="history">
+        <tr><td colspan="5" class="empty-state">Nothing looked up yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="footer-actions">
+    <button class="ghost" id="export">Download cache as parquet</button>
+    <span class="hint">Exports every cached VIN, not just this session.</span>
+  </div>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var SAMPLES = [
+    "1HGCM82633A004352", "5YJ3E1EA6PF384836", "1FTFW1ET9DFC10312",
+    "1C4RJFBG2FC625797", "5FNRL6H79NB021411", "1HD1KBM15FB620271",
+    "1XPWD40X1ED215307"
+  ];
+
+  var $ = function (id) { return document.getElementById(id); };
+  var entries = [];          // in-memory only; the server is the source of truth
+  var lookups = 0, hits = 0;
+
+  // ---- rendering helpers ---------------------------------------------------
+
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) { node.className = className; }
+    if (text !== undefined) { node.textContent = text; }
+    return node;
+  }
+
+  function field(label, value) {
+    // dt and dd are wrapped together so the grid keeps each label with its
+    // own value instead of flowing them into alternating columns.
+    var pair = el("div");
+    pair.appendChild(el("dt", null, label));
+    pair.appendChild(el("dd", value ? null : "empty", value || "not reported"));
+    return pair;
+  }
+
+  function renderResult(data, ms) {
+    var card = el("div", "card");
+    var top = el("div", "card-top");
+    top.appendChild(el("span", "vin", data.vin));
+
+    var right = el("div");
+    right.style.display = "flex";
+    right.style.alignItems = "center";
+    right.style.gap = "10px";
+    right.appendChild(el("span", "timing", ms + " ms"));
+    right.appendChild(el(
+      "span",
+      "badge " + (data.cached_result ? "cached" : "live"),
+      data.cached_result ? "cached" : "live fetch"
+    ));
+    top.appendChild(right);
+    card.appendChild(top);
+
+    var dl = el("dl");
+    dl.appendChild(field("Make", data.make));
+    dl.appendChild(field("Model", data.model));
+    dl.appendChild(field("Model year", data.model_year));
+    dl.appendChild(field("Body class", data.body_class));
+    card.appendChild(dl);
+
+    $("result").replaceChildren(card);
+  }
+
+  function renderError(status, detail) {
+    var card = el("div", "card error");
+    var top = el("div", "card-top");
+    top.appendChild(el("span", "err-code", status === 422 ? "422 · rejected" : status + " · upstream"));
+    card.appendChild(top);
+    card.appendChild(el("p", "err-detail", detail));
+    $("result").replaceChildren(card);
+  }
+
+  function renderHistory() {
+    var body = $("history");
+    if (!entries.length) {
+      var row = el("tr");
+      var cell = el("td", "empty-state", "Nothing looked up yet.");
+      cell.colSpan = 5;
+      row.appendChild(cell);
+      body.replaceChildren(row);
+      return;
+    }
+
+    body.replaceChildren.apply(body, entries.map(function (entry) {
+      var tr = el("tr");
+      tr.appendChild(el("td", "vin-cell", entry.vin));
+      tr.appendChild(el("td", null, [entry.model_year, entry.make, entry.model].filter(Boolean).join(" ")));
+
+      var source = el("td");
+      source.appendChild(el("span", "badge " + (entry.cached ? "cached" : "live"), entry.cached ? "cached" : "live"));
+      tr.appendChild(source);
+
+      tr.appendChild(el("td", "ms", entry.ms + " ms"));
+
+      var actions = el("td", "act");
+      var remove = el("button", "ghost", "Remove");
+      remove.addEventListener("click", function () { evict(entry.vin); });
+      actions.appendChild(remove);
+      tr.appendChild(actions);
+      return tr;
+    }));
+  }
+
+  function renderStats() {
+    $("stat-lookups").textContent = lookups;
+    $("stat-hits").textContent = hits;
+  }
+
+
+  // ---- underwriting --------------------------------------------------------
+  //
+  // Fired after the decode lands rather than alongside it, so the fast cached
+  // answer paints immediately and the slower assessment fills in underneath.
+  // /underwrite can make two more upstream calls; blocking the decode on it
+  // would throw away the cache's whole advantage.
+
+  var DECISION_CLASS = {
+    BLOCK: "block", REFER: "refer", CLEAR: "clear", INSUFFICIENT_DATA: "unknown"
+  };
+
+  function specGroup(title, items) {
+    if (!items || !items.length) { return null; }
+    var group = el("div", "spec-group");
+    group.appendChild(el("h3", null, title));
+    var grid = el("div", "spec-grid");
+    items.forEach(function (item) {
+      var row = el("div", "spec");
+      row.appendChild(el("span", "k", item.label));
+      row.appendChild(el("span", "v", item.value));
+      grid.appendChild(row);
+    });
+    group.appendChild(grid);
+    return group;
+  }
+
+  function renderRecall(recall) {
+    var severe = recall.park_it || recall.park_outside;
+    var box = el("div", "recall" + (severe ? " severe" : ""));
+
+    var top = el("div", "recall-top");
+    top.appendChild(el("span", "campaign", recall.campaign_number));
+    if (recall.park_it) { top.appendChild(el("span", "sev critical", "do not drive")); }
+    if (recall.park_outside) { top.appendChild(el("span", "sev critical", "park outside")); }
+    if (recall.over_the_air_update) { top.appendChild(el("span", "sev info", "OTA remedy")); }
+    if (recall.report_received_date) {
+      top.appendChild(el("span", "recall-date", recall.report_received_date));
+    }
+    box.appendChild(top);
+
+    if (recall.component) { box.appendChild(el("div", "component", recall.component)); }
+
+    [["Risk", recall.consequence], ["Remedy", recall.remedy]].forEach(function (pair) {
+      if (!pair[1]) { return; }
+      var para = el("p", "recall-text");
+      para.appendChild(el("b", null, pair[0] + ": "));
+      para.appendChild(document.createTextNode(pair[1]));
+      box.appendChild(para);
+    });
+    return box;
+  }
+
+  function renderUnderwriting(data) {
+    var uw = data.underwriting;
+    var wrap = el("div", "uw");
+
+    var banner = el("div", "uw-banner " + (DECISION_CLASS[uw.decision] || "unknown"));
+    banner.appendChild(el("span", "decision", uw.decision.replace("_", " ")));
+    var copy = el("div");
+    copy.appendChild(el("div", "uw-headline", uw.headline));
+    copy.appendChild(el("div", "uw-sub",
+      uw.open_recall_count + " campaign(s) on record · assessed " + uw.assessed_at));
+    banner.appendChild(copy);
+    wrap.appendChild(banner);
+
+    // Classification sits above the recall flags but visually apart from them:
+    // it describes the vehicle, it does not judge it. Basis strings are shown
+    // so the reader can see which decoded field produced each answer.
+    var rp = data.risk_profile;
+    if (rp) {
+      var strip = el("div", "classify");
+
+      var routeBox = el("div", "box");
+      routeBox.appendChild(el("span", "k", "Claims routing"));
+      var routeVal = el("div", "v", rp.claims_routing.label);
+      if (rp.claims_routing.commercial) {
+        routeVal.appendChild(el("span", "pill", "commercial"));
+      }
+      routeBox.appendChild(routeVal);
+      routeBox.appendChild(el("div", "why", rp.claims_routing.basis));
+      strip.appendChild(routeBox);
+
+      var energyBox = el("div", "box");
+      energyBox.appendChild(el("span", "k", "Energy source"));
+      var energyVal = el("div", "v", rp.energy_source.label);
+      if (rp.energy_source.battery_type) {
+        energyVal.appendChild(el("span", "pill", rp.energy_source.battery_type));
+      }
+      energyBox.appendChild(energyVal);
+      energyBox.appendChild(el("div", "why", rp.energy_source.basis));
+      strip.appendChild(energyBox);
+
+      wrap.appendChild(strip);
+    }
+
+    // The VIN-level caveat rides with the decision, always. A screening signal
+    // presented without its limits is how a screening signal gets mistaken for
+    // a cleared vehicle.
+    wrap.appendChild(el("p", "caveat", uw.caveat));
+
+    var energyFlags = (data.risk_profile && data.risk_profile.energy_source.flags) || [];
+    var allFlags = uw.flags.concat(energyFlags.map(function (f) {
+      // Marked as handling notes so nobody reads an EV characteristic as a
+      // recall finding. They share a list because an adjuster reads one list.
+      return {
+        code: f.code, severity: f.severity, title: f.title,
+        detail: f.detail, campaigns: [], handling: true
+      };
+    }));
+
+    if (allFlags.length) {
+      var list = el("ul", "flags");
+      allFlags.forEach(function (flag) {
+        var item = el("li", "flag");
+        item.appendChild(el("span", "sev " + flag.severity, flag.severity));
+        var body = el("div");
+        var titleRow = el("div", "flag-title", flag.title);
+        if (flag.handling) { titleRow.appendChild(el("span", "pill", "handling")); }
+        body.appendChild(titleRow);
+        body.appendChild(el("div", "flag-detail", flag.detail));
+        if (flag.campaigns.length) {
+          body.appendChild(el("div", "flag-campaigns", flag.campaigns.join("  ")));
+        }
+        item.appendChild(body);
+        list.appendChild(item);
+      });
+      wrap.appendChild(list);
+    }
+
+    if (data.recalls.length) {
+      var recallSection = el("details", "uw-section");
+      recallSection.appendChild(el("summary", null,
+        "Recall campaigns (" + data.recalls.length + ")"));
+      data.recalls.forEach(function (recall) {
+        recallSection.appendChild(renderRecall(recall));
+      });
+      wrap.appendChild(recallSection);
+    }
+
+    var rating = data.safety_rating;
+    if (rating) {
+      var ratingSection = el("details", "uw-section");
+      ratingSection.appendChild(el("summary", null, "NCAP safety ratings"));
+      ratingSection.appendChild(el("div", "uw-sub", rating.vehicle_description));
+      var stars = el("div", "stars");
+      [
+        ["Overall", rating.overall], ["Front", rating.overall_front],
+        ["Side", rating.overall_side], ["Rollover", rating.rollover],
+        ["Rollover risk", rating.rollover_possibility === null
+          ? "" : Math.round(rating.rollover_possibility * 100) + "%"],
+        ["Complaints", rating.complaints_count], ["Investigations", rating.investigation_count]
+      ].forEach(function (pair) {
+        if (pair[1] === "" || pair[1] === null || pair[1] === undefined) { return; }
+        var item = el("div", "star-item");
+        item.appendChild(el("div", "star-label", pair[0]));
+        item.appendChild(el("div", "star-value", String(pair[1])));
+        stars.appendChild(item);
+      });
+      ratingSection.appendChild(stars);
+      wrap.appendChild(ratingSection);
+    }
+
+    var mech = data.mechanical;
+    var groups = [
+      specGroup("Powertrain", mech.powertrain),
+      specGroup("Structure", mech.structure),
+      specGroup("Safety equipment", mech.safety_equipment)
+    ].filter(Boolean);
+    if (groups.length) {
+      var specSection = el("details", "uw-section");
+      specSection.appendChild(el("summary", null, "Structural & mechanical detail"));
+      groups.forEach(function (group) { specSection.appendChild(group); });
+      wrap.appendChild(specSection);
+    }
+
+    $("underwriting").replaceChildren(wrap);
+  }
+
+  function underwrite(vin) {
+    $("underwriting").replaceChildren(
+      el("div", "uw-loading", "checking recalls and safety ratings…"));
+
+    fetch("/underwrite?vin=" + encodeURIComponent(vin))
+      .then(function (response) {
+        return response.json().then(function (body) {
+          return { ok: response.ok, body: body };
+        });
+      })
+      .then(function (r) {
+        if (!r.ok) {
+          $("underwriting").replaceChildren(
+            el("div", "uw-loading", "recall check unavailable: " + (r.body.detail || "failed")));
+          return;
+        }
+        renderUnderwriting(r.body);
+        refreshCount();
+      })
+      .catch(function () {
+        $("underwriting").replaceChildren(
+          el("div", "uw-loading", "recall check unavailable"));
+      });
+  }
+
+  // ---- api calls -----------------------------------------------------------
+
+  function refreshCount() {
+    fetch("/health")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        $("stat-count").textContent = d.cached_vins;
+        $("stat-profiles").textContent = d.cached_profiles;
+      })
+      .catch(function () { $("stat-count").textContent = "?"; });
+  }
+
+  function lookup(vin) {
+    $("submit").disabled = true;
+
+    // Measured client-side, so it includes network time the way a real caller
+    // experiences it. That is the number that collapses on a cache hit.
+    var started = performance.now();
+
+    fetch("/lookup?vin=" + encodeURIComponent(vin))
+      .then(function (response) {
+        var ms = Math.round(performance.now() - started);
+        return response.json().then(function (body) {
+          return { ok: response.ok, status: response.status, body: body, ms: ms };
+        });
+      })
+      .then(function (r) {
+        if (!r.ok) {
+          renderError(r.status, r.body.detail || "Request failed.");
+          $("underwriting").replaceChildren();
+          return;
+        }
+        lookups += 1;
+        if (r.body.cached_result) { hits += 1; }
+
+        renderResult(r.body, r.ms);
+        underwrite(r.body.vin);
+        entries.unshift({
+          vin: r.body.vin, make: r.body.make, model: r.body.model,
+          model_year: r.body.model_year, cached: r.body.cached_result, ms: r.ms
+        });
+        entries = entries.slice(0, 20);
+        renderHistory();
+        renderStats();
+        refreshCount();
+      })
+      .catch(function () {
+        renderError(0, "Could not reach the API. Is the server still running?");
+      })
+      .finally(function () { $("submit").disabled = false; });
+  }
+
+  function evict(vin) {
+    fetch("/remove?vin=" + encodeURIComponent(vin), { method: "DELETE" })
+      .then(function (r) { return r.json(); })
+      .then(function () {
+        entries = entries.filter(function (e) { return e.vin !== vin; });
+        renderHistory();
+        refreshCount();
+      })
+      .catch(function () { /* the count refresh below will show reality */ });
+  }
+
+  // ---- wiring --------------------------------------------------------------
+
+  SAMPLES.forEach(function (vin) {
+    var chip = el("button", "chip", vin);
+    chip.type = "button";
+    chip.addEventListener("click", function () {
+      $("vin").value = vin;
+      lookup(vin);
+    });
+    $("samples").appendChild(chip);
+  });
+
+  $("form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    var vin = $("vin").value.trim().toUpperCase();
+    if (!vin) { return; }
+    lookup(vin);
+  });
+
+  $("export").addEventListener("click", function () {
+    // Same-origin, so a plain navigation is enough; the Content-Disposition
+    // header on the response makes the browser save it.
+    window.location.href = "/export";
+  });
+
+  refreshCount();
+})();
+</script>
+</body>
+</html>

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from contextlib import asynccontextmanager
 
 import httpx
@@ -11,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, settings
 from .db import VinCache
+from .nhtsa import NhtsaClient
 from .routes import router
 from .vpic import VinNotDecodable, VpicBadResponse, VpicClient, VpicUnavailable
 
@@ -26,6 +28,7 @@ Decode VINs via the NHTSA vPIC API, with a local SQLite cache in front of it.
 * `/lookup` - decode a VIN (cache-aside: SQLite first, vPIC on miss)
 * `/remove` - evict a VIN from the cache
 * `/export` - download the whole cache as a parquet file
+* `/underwrite` - decode plus recalls, safety ratings and an open-recall flag
 """
 
 
@@ -54,6 +57,14 @@ def create_app(config: Settings | None = None) -> FastAPI:
             base_url=config.vpic_base_url,
             max_retries=config.vpic_max_retries,
         )
+        # Shares the one httpx client: same pooling, same timeouts, one place
+        # to close. Different host, so it gets its own base URLs.
+        app.state.nhtsa = NhtsaClient(
+            http_client,
+            recalls_base_url=config.nhtsa_recalls_base_url,
+            ratings_base_url=config.nhtsa_ratings_base_url,
+            max_retries=config.vpic_max_retries,
+        )
         logger.info("startup: db=%s vpic=%s", config.db_path, config.vpic_base_url)
         try:
             yield
@@ -77,8 +88,9 @@ def _register_error_handlers(app: FastAPI) -> None:
     """Map integration failures to HTTP status codes in one place.
 
     The distinction that matters to a caller is "your VIN is bad" (422, do not
-    retry) versus "our upstream is bad" (502, retry later). Handling it here
-    keeps every route free of try/except boilerplate.
+    retry) versus "our upstream is bad" (502, retry later) versus "our own
+    storage is bad" (503). Handling it here keeps every route free of
+    try/except boilerplate.
     """
 
     @app.exception_handler(VinNotDecodable)
@@ -101,6 +113,47 @@ def _register_error_handlers(app: FastAPI) -> None:
                 "detail": "Vehicle decode service is unavailable. Please retry.",
                 "vin": None,
             },
+        )
+
+    @app.exception_handler(sqlite3.OperationalError)
+    async def _db_unavailable(request: Request, exc: sqlite3.OperationalError) -> JSONResponse:
+        """Storage problems that are about the environment, not the query.
+
+        Scoped to OperationalError on purpose. That is the family SQLite raises
+        for conditions outside the code -- a read-only file, a lock it could not
+        take, a disk it could not reach. Its siblings (IntegrityError,
+        ProgrammingError) mean we wrote a bad statement, and a 503 inviting a
+        retry would be the wrong answer for a bug that will fail identically
+        every time; those keep the default 500.
+
+        This existed as a bare "Internal Server Error" until a read-only cache
+        file produced one with nothing in the response to say what was wrong.
+        Cached VINs answered fine and only cache *misses* failed, which is a
+        confusing shape to debug from the outside -- hence the specific text.
+        """
+        message = str(exc).lower()
+        if "readonly" in message or "read-only" in message:
+            detail = (
+                "The VIN cache is not writable, so new VINs cannot be stored. "
+                "Cached VINs will still resolve. Check file ownership and "
+                "permissions on the SQLite database and its -wal/-shm files."
+            )
+            retry_after = None
+        elif "locked" in message or "busy" in message:
+            detail = "The VIN cache is busy. This is usually transient -- please retry."
+            retry_after = "1"
+        else:
+            detail = "The VIN cache is unavailable. The service cannot read or write its database."
+            retry_after = "5"
+
+        # Full text to the log, classification to the caller: the exception can
+        # name the database path, which is not something to hand out.
+        logger.error("sqlite operational error: %s", exc)
+        headers = {"Retry-After": retry_after} if retry_after else None
+        return JSONResponse(
+            status_code=503,
+            content={"detail": detail, "vin": None},
+            headers=headers,
         )
 
     @app.exception_handler(VpicBadResponse)
