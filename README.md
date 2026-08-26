@@ -386,13 +386,22 @@ fly volumes create vin_cache --region iad --size 1   # persists the SQLite cache
 fly tokens create deploy -x 8760h                    # value for FLY_API_TOKEN
 ```
 
-Then create a `production` environment under **Settings -> Environments** and
-add the token to it:
+Then add the token under **Settings -> Secrets and variables -> Actions**:
 
 | Secret / variable | Scope | Purpose |
 | ----------------- | ----- | ------- |
-| `FLY_API_TOKEN` | `production` environment | Push to `registry.fly.io`, and deploy |
+| `FLY_API_TOKEN` | **repository** secret | Push to `registry.fly.io`, and deploy |
 | `FLY_APP_URL` | repository variable (optional) | Public hostname for the release smoke test, if not `vin-decoder.fly.dev` |
+
+It has to be a *repository* secret, not an environment one. The build job
+pushes the image and does not declare an `environment:`, so it can only read
+repository-scoped secrets — an environment secret would resolve to an empty
+string there and `flyctl auth docker` would fail.
+
+Optionally create a `production` environment under **Settings -> Environments**
+for its protection rules (required reviewers, a wait timer). The deploy job
+already targets it. Protection works independently of where the secret lives,
+so there is no need to duplicate the token into it.
 
 Push to `main` to get a build number, then run **Deploy** with it.
 

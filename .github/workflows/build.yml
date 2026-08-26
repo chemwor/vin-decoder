@@ -155,6 +155,12 @@ jobs:
 
           docker rm -f smoke
 
+      - name: Install flyctl
+        # Not on the runner image; the deploy workflow installs it too. Only
+        # needed on main, where an image is actually pushed.
+        if: github.ref == 'refs/heads/main'
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
       - name: Authenticate to the Fly registry
         # Only main produces a deployable artefact. A pull request has now been
         # linted, tested and smoke-tested, which is the point of running it --
