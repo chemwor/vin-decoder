@@ -1,0 +1,26 @@
+# Keep the build context small and the image clean. Without this, `docker build`
+# ships the local virtualenv, the git history and any local cache file into the
+# build, which is slow and can leak a developer's data into a deployed image.
+.git
+.github
+.venv
+venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.idea
+.vscode
+.DS_Store
+
+# Local cache and exports. A stale vin_cache.db baked into the image would be
+# served as though it were real cached data.
+*.db
+*.db-wal
+*.db-shm
+*.parquet
+
+.env
+tests
+scripts
+*.md
