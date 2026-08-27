@@ -1,12 +1,10 @@
-# Fly.io configuration.
+# fly.toml app configuration file generated for vin-decoder on 2026-08-26T22:03:19Z
 #
-# Deliberately has no [build] section: images are built and pushed by GitHub
-# Actions, and released with `flyctl deploy --image`. Letting Fly build would
-# reintroduce the thing the pipeline exists to prevent -- an artefact reaching
-# production that is not the one the tests ran against.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
 app = "vin-decoder"
-primary_region = "iad"
+primary_region = 'iad'
 
 [env]
   # Matches the volume mount below. Also set in the Dockerfile; repeated here
@@ -22,25 +20,16 @@ primary_region = "iad"
 [http_service]
   # The container binds ${PORT:-8000} and Fly does not inject PORT, so this
   # must stay 8000 to match the Dockerfile's fallback.
-  internal_port = 8000
+  internal_port = 8080
   force_https = true
 
   # The cache lives on a volume, so a stopped machine loses nothing and a cold
   # start costs one NHTSA fetch per uncached VIN. Set min_machines_running = 1
   # if p99 latency on the first request after idle matters more than the cost.
-  auto_stop_machines = "stop"
+  auto_stop_machines = true
   auto_start_machines = true
   min_machines_running = 0
-
-  [[http_service.checks]]
-    # /health answers only if SQLite answers, so this is a readiness check
-    # rather than a liveness one -- a machine with an unreadable cache is
-    # correctly removed from rotation instead of silently serving errors.
-    interval = "30s"
-    timeout = "5s"
-    grace_period = "10s"
-    method = "GET"
-    path = "/health"
+  checks = [{ grace_period = '10s', interval = '30s', method = 'GET', path = '/health', timeout = '5s' }]
 
 [mounts]
   source = "vin_cache"
@@ -52,6 +41,7 @@ primary_region = "iad"
 # evict from whichever machine served it and no other. This is the same
 # limitation recorded in NOTES.md, just made concrete by the platform: the fix
 # is a shared cache (Postgres or Redis), not more machines.
+
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  size = 'shared-cpu-1x'
+  memory = '512mb'
