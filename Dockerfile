@@ -15,12 +15,19 @@ COPY app ./app
 
 # Where the SQLite cache lives.
 #
-# On a host with persistent volumes (Fly.io, Render, a plain VM) mount one at
-# /data and the cache survives restarts. On Heroku it will not: the dyno
-# filesystem is wiped on every deploy and at least once a day, so the cache
-# silently resets and the hit rate goes to zero with nothing reporting it.
-# That is the known limitation of this deployment, not a bug in the service,
-# and the fix is a shared cache in Postgres or Redis rather than a local file.
+# On Fly this path is a volume, declared in the [mounts] block of fly.toml, so
+# the cache survives deploys and machine restarts. Any host with persistent
+# disk (Render, a plain VM) works the same way by mounting one here.
+#
+# A host without persistent disk still runs the service correctly, because a
+# cache miss is only a call to vPIC. What it loses is the hit rate, silently:
+# nothing errors and nothing alerts, and the only symptom is latency and
+# upstream call volume that nobody is watching. That is the argument for
+# choosing a host with volumes rather than a limitation to document.
+#
+# The volume does not solve scaling. See the note at the end of fly.toml: one
+# volume attaches to one machine, so N machines means N independent caches.
+# The fix for that is a shared cache in Postgres or Redis, not more machines.
 ENV VIN_DB_PATH=/data/vin_cache.db
 
 # No `VOLUME ["/data"]` here. On Fly the [mounts] block in fly.toml is what
@@ -32,17 +39,22 @@ ENV VIN_DB_PATH=/data/vin_cache.db
 RUN useradd --create-home --uid 10001 appuser && mkdir -p /data && chown appuser /data
 USER appuser
 
-# Documentation only. Heroku ignores EXPOSE and injects its own $PORT.
+# Documentation only. Fly routes to `internal_port` from fly.toml, which is
+# set to 8000 to match the CMD fallback below.
 EXPOSE 8000
 
-# Used by plain `docker run` and compose. Heroku ignores Docker healthchecks
-# and does its own thing, which is why the pipeline smoke-tests /health over
-# the public URL after releasing instead of relying on this.
+# Used by plain `docker run`, by compose, and by the container smoke test in
+# the build pipeline. Fly runs its own check from the [[http_service.checks]]
+# block instead of this one, and the deploy pipeline additionally smoke-tests
+# /health over the public URL after releasing.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s CMD \
   python -c "import os,urllib.request,sys; p=os.getenv('PORT','8000'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=2).status == 200 else 1)"
 
-# Shell form so ${PORT} is expanded at runtime. Heroku assigns the port
-# dynamically and terminates any dyno that fails to bind to it, so a hardcoded
-# port is the difference between a container that runs locally and one that
-# also runs on a PaaS. Locally, $PORT is unset and it falls back to 8000.
+# Shell form so ${PORT} is expanded at runtime rather than baked in.
+#
+# Fly does not inject PORT; it routes to fly.toml's internal_port, so here the
+# 8000 fallback is what actually binds and the two must agree. The variable is
+# still read because platforms that do assign a port dynamically (Heroku, Cloud
+# Run, App Runner) terminate any container that fails to bind to theirs, and
+# supporting them costs one line. Locally, unset means 8000.
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
